@@ -1,13 +1,1 @@
-streamlit
-groq
-langchain
-langchain-groq
-python-dotenv
-requests
-pandas
-numpy
-pillow
-faster-whisper
-sounddevice
-soundfile
-PyPDF2
+
