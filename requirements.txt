@@ -10,3 +10,4 @@ pillow
 faster-whisper
 sounddevice
 soundfile
+PyPDF2
