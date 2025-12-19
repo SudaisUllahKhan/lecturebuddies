@@ -8,15 +8,11 @@ import json
 import time
 from dotenv import load_dotenv
 from document_processor import DocumentProcessor
-import sounddevice as sd
 import numpy as np
-import soundfile as sf
-import threading
-import queue
 import tempfile
 from faster_whisper import WhisperModel
-import speech_recognition as sr
-
+# CHANGED: Replaced crashing local libraries with web-compatible recorder
+from streamlit_mic_recorder import mic_recorder
 
 # ==========================
 # PAGE CONFIGURATION
@@ -54,12 +50,11 @@ def init_session_state():
         "quiz_temperature": 0.7,
 
         # Live Lecture Recording
-        "rec_thread": None,
-        "audio_queue": None,
         "recording": False,
         "transcript": "",
         "partial_transcript": "",
         "chunks_saved": [],
+        "live_transcript": "", # Added this back
 
         # Dashboard
         "selected_feature": None
@@ -71,7 +66,7 @@ def init_session_state():
 init_session_state()
 
 # ==========================
-# LOAD API KEY
+# LOAD API KEY (UNCHANGED)
 # ==========================
 load_dotenv()
 api_key = os.getenv("GROQ_API_KEY")
@@ -1204,8 +1199,7 @@ def show_chatbot_feature():
     # ---------------------------
     # Load API Key from .env
     # ---------------------------
-    load_dotenv()
-    api_key = os.getenv("GROQ_API_KEY")  # make sure your .env has GROQ_API_KEY=your_api_key_here
+    # (Already loaded globally via st.secrets check)
     
     if not api_key:
         st.error("⚠️ API key missing! Please check your .env file.")
@@ -1499,7 +1493,7 @@ def show_chatbot_feature():
         if st.button("🗑️ Clear Chat", key="clear_chat", help="Start a new conversation"):
             st.session_state.messages.clear()
             st.rerun()
-    
+        
         st.markdown("---")
         st.markdown("**📎 Upload Files**")
         sidebar_upload = st.file_uploader(
@@ -1520,14 +1514,14 @@ def show_chatbot_feature():
             st.session_state.uploaded_files.append(file_details)
             st.sidebar.success(f"✅ {sidebar_upload.name} uploaded!")
             st.rerun()
-    
+        
         # Sidebar tips (Compact)
         st.markdown("---")
         st.markdown("**💡 Quick Tips:**")
         st.markdown("- Ask about studies or homework")
         st.markdown("- Upload files for context")
         st.markdown("- Be specific for better responses")
-    
+        
         # Show uploaded files (Styled)
         if st.session_state.uploaded_files:
             st.markdown("---")
@@ -1609,7 +1603,7 @@ def show_chatbot_feature():
     if user_input and user_input.strip():
         # 🔑 Inject file content here
         final_input = inject_file_content(user_input.strip())
-    
+        
         st.session_state.messages.append({"role": "user", "content": user_input.strip()})
         with st.spinner("🤔 Thinking..."):
             reply = get_groq_response(final_input)
@@ -1856,7 +1850,7 @@ def show_recording_feature():
                                 os.remove(temp_path)
 
     # ==========================
-    # TAB 2: Realtime Transcript (UPDATED CODE)
+    # TAB 2: Realtime Transcript (UPDATED FOR INTERNET)
     # ==========================
     with tab2:
         st.markdown("### ⚡ Fast Real-time Transcription")
@@ -1868,10 +1862,16 @@ def show_recording_feature():
         col1, col2 = st.columns([1, 2])
 
         with col1:
-            st.info("💡 **Instructions:**\n1. Click 'Start Recording'.\n2. Speak into your mic.\n3. The text will appear instantly.\n4. To STOP, click 'Stop' in the top-right corner of the app or refresh the page.")
+            st.info("💡 **Instructions:**\n1. Click 'Record' below.\n2. Speak.\n3. Click 'Stop' to send audio to AI.\n(Note: On the internet, audio processes after you stop speaking).")
             
-            # Start Button
-            start_recording = st.button("🔴 Start Live Recording", use_container_width=True)
+            # Use web-recorder instead of local mic
+            audio_data = mic_recorder(
+                start_prompt="🔴 Start Recording",
+                stop_prompt="⏹️ Stop & Transcribe",
+                key='recorder',
+                format='wav',
+                use_container_width=True
+            )
             
             # Download Button (Visible if we have text)
             if st.session_state.live_transcript:
@@ -1889,72 +1889,31 @@ def show_recording_feature():
 
         with col2:
             st.markdown("#### 📝 Live Output")
-            # Create a placeholder to update text in real-time
-            transcript_placeholder = st.empty()
             
-            # Show existing transcript if not recording
-            if not start_recording:
-                transcript_placeholder.text_area("Transcript", value=st.session_state.live_transcript, height=400, disabled=True)
-
-            # ==========================
-            # THE NEW LOGIC INTEGRATION
-            # ==========================
-            if start_recording:
-                # 1. Setup Speech Recognition
-                recognizer = sr.Recognizer()
-                recognizer.energy_threshold = 1000  
-                recognizer.dynamic_energy_threshold = False
-                recognizer.pause_threshold = 0.3    
-                recognizer.phrase_threshold = 0.3   
-                recognizer.non_speaking_duration = 0.3
-                
-                mic = sr.Microphone(sample_rate=16000)
-                
-                # Visual Indicator
-                st.toast("🎤 Listening... Speak now!", icon="👂")
-                
-                with mic as source:
-                    recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            # Logic to process audio when user stops recording
+            if audio_data is not None:
+                with st.spinner("⚡ Transcribing audio chunk..."):
+                    # Save bytes to temp file for Whisper
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_audio:
+                        tmp_audio.write(audio_data['bytes'])
+                        tmp_audio_path = tmp_audio.name
                     
-                    # We use a loop here. In Streamlit, this runs until the user stops/refreshes.
                     try:
-                        while True:
-                            # 2. Listen
-                            # We use a placeholder info to show "Listening"
-                            status_ph = st.empty()
-                            status_ph.caption("👂 Listening...")
-                            
-                            audio_data = recognizer.listen(source, timeout=None, phrase_time_limit=5) # 5s chunks for fluidity
-                            
-                            status_ph.caption("⚡ Processing...")
-                            
-                            # 3. Process Audio for Whisper
-                            raw_data = audio_data.get_raw_data()
-                            audio_np = np.frombuffer(raw_data, dtype=np.int16).astype(np.float32) / 32768.0
-
-                            # 4. Transcribe (Fastest Settings)
-                            segments, _ = model.transcribe(audio_np, beam_size=1, language="en", vad_filter=False)
-                            new_text = "".join([s.text for s in segments]).strip()
-
-                            if new_text:
-                                # Append to session state
-                                st.session_state.live_transcript += new_text + " "
-                                
-                                # Update the UI immediately
-                                transcript_placeholder.text_area(
-                                    "Transcript (Recording...)", 
-                                    value=st.session_state.live_transcript, 
-                                    height=400
-                                )
-                                
-                            status_ph.empty()
-                            
+                        # Transcribe
+                        segments, _ = model.transcribe(tmp_audio_path, beam_size=1, language="en")
+                        new_text = "".join([s.text for s in segments]).strip()
+                        
+                        if new_text:
+                            st.session_state.live_transcript += new_text + " "
+                            st.success("Audio processed!")
                     except Exception as e:
-                        st.error(f"Recording stopped or error: {e}")
+                        st.error(f"Error processing audio: {e}")
+                    finally:
+                        if os.path.exists(tmp_audio_path):
+                            os.remove(tmp_audio_path)
 
-
-
-
+            # Show existing transcript
+            st.text_area("Transcript", value=st.session_state.live_transcript, height=400, disabled=True)
 
 # ==========================
 # FLASH CARDS FEATURE
@@ -2793,140 +2752,6 @@ def extract_content_from_file(uploaded_file):
             return uploaded_file.read().decode("utf-8", errors="ignore").strip()
     except Exception as e:
         return f"Error extracting content: {str(e)}"
-
-# Recording helper functions
-def record_worker(audio_q: queue.Queue, stop_event: threading.Event):
-    """Recording thread worker"""
-    while not stop_event.is_set():
-        time.sleep(0.1)
-
-def sd_callback(indata, frames, time_info, status):
-    """Callback for sounddevice.InputStream"""
-    if status:
-        pass
-    mono = np.mean(indata, axis=1).astype(np.float32)
-    # guard: audio_queue may be None if recording not properly started
-    if st.session_state.get("audio_queue") is not None:
-        try:
-            st.session_state.audio_queue.put(mono)
-        except Exception:
-            pass
-
-def transcription_consumer(model: WhisperModel, chunk_seconds=5):
-    """Transcription consumer thread"""
-    sample_per_chunk = chunk_seconds * 16000
-    buffer = np.zeros((0,), dtype=np.float32)
-    chunk_index = 0
-
-    while st.session_state.recording or (st.session_state.audio_queue is not None and not st.session_state.audio_queue.empty()):
-        try:
-            while st.session_state.audio_queue is not None and not st.session_state.audio_queue.empty():
-                data = st.session_state.audio_queue.get_nowait()
-                buffer = np.concatenate((buffer, data))
-
-            if buffer.shape[0] >= sample_per_chunk:
-                to_process = buffer[:sample_per_chunk]
-                buffer = buffer[sample_per_chunk:]
-
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                    tmp_path = tmp.name
-                    sf.write(tmp_path, to_process, 16000, subtype="PCM_16")
-
-                segments, info = model.transcribe(tmp_path, beam_size=5)
-                partial_text = ""
-                for seg in segments:
-                    partial_text += seg.text
-
-                prev = st.session_state.transcript
-                st.session_state.transcript = (prev + " " + partial_text).strip()
-                st.session_state.partial_transcript = partial_text
-
-                saved_chunk = os.path.join("temp_recordings", f"chunk_{int(time.time())}_{chunk_index}.wav")
-                os.replace(tmp_path, saved_chunk)
-                st.session_state.chunks_saved.append(saved_chunk)
-                chunk_index += 1
-            else:
-                time.sleep(0.2)
-        except Exception:
-            time.sleep(0.1)
-    return
-
-# Realtime recording helper functions
-def realtime_record_worker(audio_q: queue.Queue, stop_event: threading.Event):
-    """Recording thread worker for realtime"""
-    while not stop_event.is_set():
-        time.sleep(0.1)
-
-def realtime_sd_callback(indata, frames, time_info, status):
-    """Callback for sounddevice.InputStream in realtime mode"""
-    if status:
-        pass
-    mono = np.mean(indata, axis=1).astype(np.float32)
-    if st.session_state.get("realtime_queue") is not None:
-        try:
-            st.session_state.realtime_queue.put(mono)
-        except Exception:
-            pass
-
-def realtime_transcription_consumer(model: WhisperModel, chunk_seconds=5):
-    """Transcription consumer thread for realtime"""
-    sample_per_chunk = chunk_seconds * 16000
-    buffer = np.zeros((0,), dtype=np.float32)
-    chunk_index = 0
-
-    while st.session_state.realtime_recording or (st.session_state.realtime_queue is not None and not st.session_state.realtime_queue.empty()):
-        try:
-            # Get audio data from queue
-            while st.session_state.realtime_queue is not None and not st.session_state.realtime_queue.empty():
-                data = st.session_state.realtime_queue.get_nowait()
-                buffer = np.concatenate((buffer, data))
-
-            # Process when we have enough data
-            if buffer.shape[0] >= sample_per_chunk:
-                to_process = buffer[:sample_per_chunk]
-                buffer = buffer[sample_per_chunk:]
-
-                # Save audio chunk to temporary file
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                    tmp_path = tmp.name
-                    sf.write(tmp_path, to_process, 16000, subtype="PCM_16")
-
-                # Transcribe the chunk
-                try:
-                    segments, info = model.transcribe(tmp_path, beam_size=5)
-                    partial_text = ""
-                    for seg in segments:
-                        partial_text += seg.text
-
-                    # Update session state
-                    if partial_text.strip():
-                        prev = st.session_state.realtime_transcript
-                        st.session_state.realtime_transcript = (prev + " " + partial_text).strip()
-                        st.session_state.realtime_partial = partial_text
-                        
-                        # Save chunk for debugging
-                        saved_chunk = os.path.join("temp_recordings", f"realtime_chunk_{int(time.time())}_{chunk_index}.wav")
-                        os.replace(tmp_path, saved_chunk)
-                        st.session_state.realtime_chunks.append(saved_chunk)
-                        chunk_index += 1
-                        
-                        print(f"Transcribed chunk {chunk_index}: {partial_text}")  # Debug print
-                    else:
-                        print(f"No text in chunk {chunk_index}")  # Debug print
-                        os.remove(tmp_path)
-                        
-                except Exception as e:
-                    print(f"Transcription error: {e}")  # Debug print
-                    try:
-                        os.remove(tmp_path)
-                    except:
-                        pass
-            else:
-                time.sleep(0.2)
-        except Exception as e:
-            print(f"Consumer error: {e}")  # Debug print
-            time.sleep(0.1)
-    return
 
 # ==========================
 # MAIN APPLICATION LOGIC
